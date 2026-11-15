@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Auto-login for the BITS Pilani FortiGate firewall portal (fw.bits-pilani.ac.in:8090).
+#
+#   bits-wifi-login setup    save username/password (prompted, stored chmod 600)
+#   bits-wifi-login once     check once, log in if the portal is asking
+#   bits-wifi-login          run forever (used by the systemd user service)
+#   bits-wifi-login logout   end the current firewall session (for testing)
+
+set -u
+
+PORTAL_HOST="fw.bits-pilani.ac.in:8090"          # credentials are only ever sent here, over verified HTTPS
+SSID_PATTERN="${BITS_SSID_PATTERN:-^BITS-}"      # only act on these Wi-Fi networks
+PROBE_URL="http://connectivitycheck.gstatic.com/generate_204"
+CHECK_INTERVAL="${BITS_CHECK_INTERVAL:-15}"      # seconds between checks
+AUTH_FAIL_BACKOFF=600                            # wait after a rejected password (avoid lockouts)
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/bits-wifi-login"
+CRED_FILE="$CONF_DIR/credentials"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/bits-wifi-login"
+KEEPALIVE_FILE="$STATE_DIR/keepalive-url"
+mkdir -p "$STATE_DIR"
+
+log()    { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+notify() { command -v notify-send >/dev/null && notify-send -a "BITS Wi-Fi" "$@" 2>/dev/null || true; }
+
+on_bits_wifi() {
+  nmcli -t -f NAME,TYPE connection show --active 2>/dev/null |
+    awk -F: '$2 ~ /wireless/ {print $1}' | grep -Eq "$SSID_PATTERN"
+}
+
+# Reads "username=..." / "password=..." literally (file is never sourced).
+load_credentials() {
+  [ -r "$CRED_FILE" ] || return 1
+  USERNAME=$(sed -n 's/^username=//p' "$CRED_FILE" | head -n1)
+  PASSWORD=$(sed -n 's/^password=//p' "$CRED_FILE" | head -n1)
+  [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]
+}
+
+# Escape a value for a double-quoted string in a curl config file.
+cfg_escape() { local s=${1//\\/\\\\}; printf '%s' "${s//\"/\\\"}"; }
+
+field() { # field <name> <html>  -> value of a hidden <input>
+  local v
+  v=$(grep -oE "name=\"$1\"[^>]*value=\"[^\"]*\"" <<<"$2" | head -n1 | sed -E 's/.*value="([^"]*)"/\1/')
+  [ -n "$v" ] || v=$(grep -oE "value=\"[^\"]*\"[^>]*name=\"$1\"" <<<"$2" | head -n1 | sed -E 's/value="([^"]*)".*/\1/')
+  printf '%s' "$v"
+}
+
+# Returns: 0 online / logged in, 1 transient problem, 2 credentials rejected or missing
+check_and_login() {
+  local probe status auth_url page magic redir resp keepalive
+
+  probe=$(curl -s -i -m 8 "$PROBE_URL" 2>/dev/null) || return 1
+  status=$(head -n1 <<<"$probe" | awk '{print $2}')
+  [ "$status" = "204" ] && return 0
+
+  auth_url=$(grep -oE "https://${PORTAL_HOST//./\\.}/fgtauth\?[0-9a-fA-F]+" <<<"$probe" | head -n1)
+  if [ -z "$auth_url" ]; then
+    log "probe returned HTTP ${status:-?} but no BITS portal redirect; ignoring"
+    return 1
+  fi
+
+  if ! load_credentials; then
+    log "portal wants a login but $CRED_FILE is missing/incomplete - run: bits-wifi-login setup"
+    return 2
+  fi
+
+  page=$(curl -s -m 10 "$auth_url") || { log "could not fetch login page"; return 1; }
+  magic=$(field magic "$page")
+  redir=$(field 4Tredir "$page")
+  [ -n "$magic" ] || magic=${auth_url##*\?}
+  [ -n "$redir" ] || redir=$PROBE_URL
+
+  resp=$(curl -s -m 15 -e "$auth_url" -K - "https://$PORTAL_HOST/" <<EOF
+data-urlencode = "4Tredir=$(cfg_escape "$redir")"
+data-urlencode = "magic=$(cfg_escape "$magic")"
+data-urlencode = "username=$(cfg_escape "$USERNAME")"
+data-urlencode = "password=$(cfg_escape "$PASSWORD")"
+EOF
+  ) || { log "login request failed"; return 1; }
+
+  keepalive=$(grep -oE "https://${PORTAL_HOST//./\\.}/keepalive\?[0-9a-fA-F]+" <<<"$resp" | head -n1)
+  if [ -n "$keepalive" ]; then
+    printf '%s\n' "$keepalive" >"$KEEPALIVE_FILE"
+    log "logged in as $USERNAME"
+    notify "Reconnected" "Firewall login renewed for $USERNAME"
+    return 0
+  fi
+
+  # Some firmware answers without the keepalive link; trust a working connection.
+  if [ "$(curl -s -o /dev/null -m 8 -w '%{http_code}' "$PROBE_URL")" = "204" ]; then
+    log "logged in as $USERNAME (no keepalive link in response)"
+    return 0
+  fi
+
+  if grep -qiE 'fail|invalid|incorrect|denied' <<<"$resp"; then
+    log "portal rejected the username/password"
+    notify -u critical "Login rejected" "Check credentials: bits-wifi-login setup"
+    return 2
+  fi
+  log "login did not succeed (unrecognised response)"
+  printf '%s\n' "$resp" | head -c 4000 >"$STATE_DIR/last-response.html"
+  return 1
+}
+
+cmd_setup() {
+  local u p
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  read -rp "BITS username: " u
+  read -rsp "Password: " p; echo
+  ( umask 077; printf 'username=%s\npassword=%s\n' "$u" "$p" >"$CRED_FILE" )
+  echo "Saved to $CRED_FILE (readable only by you)."
+}
+
+cmd_logout() {
+  local url
+  url=$(cat "$KEEPALIVE_FILE" 2>/dev/null) || { echo "No known session (no keepalive URL saved)."; return 1; }
+  curl -s -m 10 -o /dev/null "${url/keepalive/logout}" && echo "Logged out." && rm -f "$KEEPALIVE_FILE"
+}
+
+cmd_loop() {
+  local rc cred_mtime="" blocked_until=0
+  log "watching for BITS firewall logouts (every ${CHECK_INTERVAL}s)"
+  while :; do
+    if on_bits_wifi; then
+      # After a rejected password, hold off until the backoff ends or the credentials change.
+      if [ "$(date +%s)" -ge "$blocked_until" ] || [ "$(stat -c %Y "$CRED_FILE" 2>/dev/null)" != "$cred_mtime" ]; then
+        check_and_login; rc=$?
+        if [ "$rc" = 2 ]; then
+          blocked_until=$(( $(date +%s) + AUTH_FAIL_BACKOFF ))
+          cred_mtime=$(stat -c %Y "$CRED_FILE" 2>/dev/null)
+        else
+          blocked_until=0
+        fi
+      fi
+    fi
+    sleep "$CHECK_INTERVAL"
+  done
+}
+
+case "${1:-loop}" in
+  setup)  cmd_setup ;;
+  once)   check_and_login; rc=$?; [ $rc = 0 ] && log "online"; exit $rc ;;
+  logout) cmd_logout ;;
+  loop)   cmd_loop ;;
+  *)      sed -n '2,8p' "$0"; exit 64 ;;
+esac

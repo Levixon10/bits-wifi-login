@@ -1,0 +1,10 @@
+[Unit]
+Description=Auto-login to the BITS Pilani Wi-Fi firewall portal
+
+[Service]
+ExecStart=%h/.local/bin/bits-wifi-login
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
